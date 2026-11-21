@@ -290,13 +290,35 @@ function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
 // default agent = ECONNRESET 100%, X25519 = through 100%.
 const TLS_ECDH_CURVE = process.env.NINEROUTER_TLS_ECDH_CURVE || "X25519";
 
+// Some servers don't accept an X25519-only ClientHello and reset the handshake
+// (AWS SSO OIDC `oidc.*.amazonaws.com`, used by Kiro login + token refresh).
+// On such a reset we retry once with Node's default curve list and remember the
+// host so later calls skip the doomed X25519-only attempt.
+const DEFAULT_CURVE_HOSTS = new Set();
+
+function isTlsHandshakeReset(err) {
+  const code = err?.cause?.code || err?.code;
+  const msg = `${err?.message || ""} ${err?.cause?.message || ""}`;
+  return code === "ECONNRESET" && msg.includes("before secure TLS connection was established");
+}
+
+function hostOf(url) {
+  try { return new URL(typeof url === "string" ? url : url.toString()).hostname; } catch { return ""; }
+}
+
 // autoSelectFamilyAttemptTimeout = happy eyeballs (RFC 8305): race both address
 // families, fall over in 250ms — replaces the old global ipv4first flag, which fixed
 // one broken-family network by breaking the other (see claude-code#20240).
 // requestTls must stay TLS-options-only (connect-level options belong in `connect`).
 const EYEBALLS_CONNECT = { autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 };
-function buildConnectOptions(insecure) {
-  return { ...EYEBALLS_CONNECT, ecdhCurve: TLS_ECDH_CURVE, ...(insecure ? { rejectUnauthorized: false } : {}) };
+function buildTlsOptions(insecure, defaultCurves) {
+  return {
+    ...(defaultCurves ? {} : { ecdhCurve: TLS_ECDH_CURVE }),
+    ...(insecure ? { rejectUnauthorized: false } : {}),
+  };
+}
+function buildConnectOptions(insecure, defaultCurves = false) {
+  return { ...EYEBALLS_CONNECT, ...buildTlsOptions(insecure, defaultCurves) };
 }
 
 function evictOldest(cacheMap) {
@@ -305,13 +327,13 @@ function evictOldest(cacheMap) {
   }
 }
 
-async function getOrCreateDirectAgent(key, insecure, keepAliveTimeout, keepAliveMaxTimeout) {
+async function getOrCreateDirectAgent(key, insecure, keepAliveTimeout, keepAliveMaxTimeout, defaultCurves = false) {
   const cached = directDispatchers.get(key);
   if (cached) return cached;
   const { Agent } = await import("undici");
   evictOldest(directDispatchers);
   const agent = new Agent({
-    connect: buildConnectOptions(insecure),
+    connect: buildConnectOptions(insecure, defaultCurves),
     keepAliveTimeout,
     keepAliveMaxTimeout,
   });
@@ -324,23 +346,25 @@ async function getOrCreateDirectAgent(key, insecure, keepAliveTimeout, keepAlive
  * reusing idle sockets that upstream edges (NVIDIA NIM, Cloudflare) silently
  * dropped without sending a TCP RST.
  */
-export function getDirectDispatcher(insecure = false) {
+export function getDirectDispatcher(insecure = false, defaultCurves = false) {
   const { keepAliveTimeout, keepAliveMaxTimeout } = resolveKeepAliveTimeouts();
-  const key = `direct::${insecure ? "insecure" : "secure"}::${keepAliveTimeout}::${keepAliveMaxTimeout}`;
-  return getOrCreateDirectAgent(key, insecure, keepAliveTimeout, keepAliveMaxTimeout);
+  const curveTag = defaultCurves ? "::default-curves" : "";
+  const key = `direct::${insecure ? "insecure" : "secure"}::${keepAliveTimeout}::${keepAliveMaxTimeout}${curveTag}`;
+  return getOrCreateDirectAgent(key, insecure, keepAliveTimeout, keepAliveMaxTimeout, defaultCurves);
 }
 
 /**
  * No-keep-alive retry dispatcher (`keepAliveTimeout: 1ms`) — guarantees a fresh
  * TCP/TLS connection after a poisoned pooled socket or a connect timeout.
  */
-export function getFreshRetryDispatcher(insecure = false) {
-  const key = `fresh::${insecure ? "insecure" : "secure"}`;
+export function getFreshRetryDispatcher(insecure = false, defaultCurves = false) {
+  const key = `fresh::${insecure ? "insecure" : "secure"}${defaultCurves ? "::default-curves" : ""}`;
   return getOrCreateDirectAgent(
     key,
     insecure,
     FRESH_RETRY_KEEPALIVE_TIMEOUT_MS,
-    FRESH_RETRY_KEEPALIVE_TIMEOUT_MS
+    FRESH_RETRY_KEEPALIVE_TIMEOUT_MS,
+    defaultCurves
   );
 }
 
@@ -349,13 +373,15 @@ export function getFreshRetryDispatcher(insecure = false) {
  * Always returns a dispatcher — the direct path needs the custom Agent too,
  * otherwise the default global agent's ClientHello gets RST-ed by DPI.
  */
-async function getDispatcher(proxyUrl, insecure = false, forceFreshSocket = false) {
+async function getDispatcher(proxyUrl, insecure = false, forceFreshSocket = false, defaultCurves = false) {
   const normalized = normalizeProxyUrl(proxyUrl);
   if (!normalized) {
-    return forceFreshSocket ? getFreshRetryDispatcher(insecure) : getDirectDispatcher(insecure);
+    return forceFreshSocket
+      ? getFreshRetryDispatcher(insecure, defaultCurves)
+      : getDirectDispatcher(insecure, defaultCurves);
   }
 
-  const key = `${normalized}::${insecure ? "insecure" : "secure"}`;
+  const key = `${normalized}::${insecure ? "insecure" : "secure"}${defaultCurves ? "::default-curves" : ""}`;
   if (!proxyDispatchers.has(key)) {
     // Evict oldest entry if max size reached
     if (proxyDispatchers.size >= MEMORY_CONFIG.proxyDispatchersMaxSize) {
@@ -365,7 +391,7 @@ async function getDispatcher(proxyUrl, insecure = false, forceFreshSocket = fals
     const dispatcher = new ProxyAgent({
       uri: normalized,
       connect: EYEBALLS_CONNECT,
-      requestTls: { ecdhCurve: TLS_ECDH_CURVE, ...(insecure ? { rejectUnauthorized: false } : {}) },
+      requestTls: buildTlsOptions(insecure, defaultCurves),
     });
     proxyDispatchers.set(key, dispatcher);
   }
@@ -378,11 +404,13 @@ function isBodyReplaySafe(body) {
 }
 
 async function fetchWithTlsFallback(url, options, proxyUrl, forceFreshSocket = false) {
+  const host = hostOf(url);
+  const defaultCurves = DEFAULT_CURVE_HOSTS.has(host);
   try {
     // Protocol adapters may need Node's HTTP/1 transport on the direct path.
     // Keep proxy/no-proxy resolution and strict-proxy enforcement here.
     if (!proxyUrl && options.directFetch) return await options.directFetch(url, options);
-    const dispatcher = await getDispatcher(proxyUrl, false, forceFreshSocket);
+    const dispatcher = await getDispatcher(proxyUrl, false, forceFreshSocket, defaultCurves);
     return await rawFetch(url, { ...options, dispatcher });
   } catch (err) {
     const isStrictSsl = options.strictTls === true || process.env.STRICT_SSL === "true" || process.env.STRICT_SSL === "1";
@@ -392,8 +420,24 @@ async function fetchWithTlsFallback(url, options, proxyUrl, forceFreshSocket = f
       }
       // ponytail: in-memory insecure agent fallback for self-signed MITM corporate/antivirus certs
       console.warn(`[ProxyFetch] TLS cert verification failed (${err.cause?.code || err.code}), retrying with insecure TLS: ${url}`);
-      const insecureDispatcher = await getDispatcher(proxyUrl, true, forceFreshSocket);
+      const insecureDispatcher = await getDispatcher(proxyUrl, true, forceFreshSocket, defaultCurves);
       return await rawFetch(url, { ...options, dispatcher: insecureDispatcher });
+    }
+
+    // Server rejected the X25519-only ClientHello: retry once with Node's default curves.
+    if (
+      !defaultCurves
+      && host
+      && !options.directFetch
+      && !options.signal?.aborted
+      && isBodyReplaySafe(options.body)
+      && isTlsHandshakeReset(err)
+    ) {
+      dbg("FETCH", `TLS handshake reset with ecdhCurve=${TLS_ECDH_CURVE}, retrying with default curves: ${host}`);
+      const fallbackDispatcher = await getDispatcher(proxyUrl, false, true, true);
+      const res = await rawFetch(url, { ...options, dispatcher: fallbackDispatcher });
+      DEFAULT_CURVE_HOSTS.add(host);
+      return res;
     }
 
     // Stale keep-alive recovery: a pooled socket died before returning headers. Replay

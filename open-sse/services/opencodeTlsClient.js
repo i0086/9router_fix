@@ -8,8 +8,11 @@
 // JA4's cipher hash identifies the list (Bun: 5b57614c22b0), so the match is on
 // the cipher-list hash and nothing else — reordering the same list still passes.
 //
-// wreq-js is an optional dependency; when absent the caller keeps its native
-// fetch and stays subject to the gate rather than failing the request here.
+// wreq-js is an optional dependency with prebuilt binaries for a fixed set of
+// platforms (no FreeBSD, for one). When it cannot load, requests fall back to
+// undici with the same cipher list: Node's OpenSSL honours `ciphers` for the
+// ClientHello, and that list alone passes the gate (verified 2026-11-21:
+// undici+cipherList 200, undici default 429 FreeUsageLimitError).
 
 import { loadRuntimeDep } from "./lazyRuntime.js";
 
@@ -36,6 +39,11 @@ const OPENCODE_CIPHER_LIST = [
 ].join(":");
 
 const DEFAULT_TIMEOUT_MS = 120000;
+
+// Same happy-eyeballs settings as proxyFetch's dispatchers.
+const NATIVE_CONNECT = { autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 };
+// undici's ProxyAgent tunnels http/https proxies only.
+const NATIVE_PROXY_PROTOCOLS = new Set(["http:", "https:"]);
 
 // A wreq-js session pins one proxy at creation ("Session proxy cannot be
 // changed after creation"), so the cache must be keyed by proxy URL: a proxy
@@ -98,11 +106,69 @@ async function loadSession(proxyUrl = "") {
   return sessionsByProxy.get(key);
 }
 
+// Fallback transport: one undici dispatcher per proxy key ("" = direct).
+const nativeDispatchers = new Map();
+let undiciModule = null;
+let nativeFallbackLogged = false;
+
+async function loadNativeDispatcher(proxyUrl, timeoutMs) {
+  const key = `${normalizeProxyKey(proxyUrl)}::${timeoutMs}`;
+  const cached = nativeDispatchers.get(key);
+  if (cached) return cached;
+  undiciModule ??= await import("undici");
+  const { Agent, ProxyAgent } = undiciModule;
+  let dispatcher;
+  if (proxyUrl) {
+    let protocol = "";
+    try { protocol = new URL(proxyUrl).protocol; } catch { /* handled below */ }
+    if (!NATIVE_PROXY_PROTOCOLS.has(protocol)) {
+      // Never fall back to a direct connection when a proxy was selected.
+      throw new Error(`proxy scheme ${protocol || "(unparseable)"} needs wreq-js; only http/https proxies work without it`);
+    }
+    dispatcher = new ProxyAgent({
+      uri: proxyUrl,
+      connect: NATIVE_CONNECT,
+      requestTls: { ciphers: OPENCODE_CIPHER_LIST },
+      headersTimeout: timeoutMs,
+    });
+  } else {
+    dispatcher = new Agent({
+      connect: { ...NATIVE_CONNECT, ciphers: OPENCODE_CIPHER_LIST },
+      headersTimeout: timeoutMs,
+    });
+  }
+  if (nativeDispatchers.size >= SESSIONS_MAX) {
+    const oldestKey = nativeDispatchers.keys().next().value;
+    nativeDispatchers.get(oldestKey)?.close?.().catch?.(() => {});
+    nativeDispatchers.delete(oldestKey);
+  }
+  nativeDispatchers.set(key, dispatcher);
+  return dispatcher;
+}
+
+async function nativeTlsFetch(url, init, { signal, timeoutMs, proxyUrl }) {
+  const dispatcher = await loadNativeDispatcher(proxyUrl, timeoutMs);
+  const res = await undiciModule.fetch(url, {
+    method: init.method || "GET",
+    headers: init.headers,
+    body: init.body,
+    redirect: "follow",
+    signal,
+    dispatcher,
+  });
+  if (!proxyUrl) return res;
+  const headers = new Headers(res.headers);
+  headers.set("x-9r-proxy-via", normalizeProxyKey(proxyUrl) || "undici-proxy");
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 /** Drop the cached session(s) so the next call builds a fresh one. */
 export function resetOpencodeTlsSession() {
   const pending = [...sessionsByProxy.values()];
   sessionsByProxy.clear();
   for (const promise of pending) promise?.then?.((session) => session.close?.()).catch(() => {});
+  for (const dispatcher of nativeDispatchers.values()) dispatcher?.close?.().catch?.(() => {});
+  nativeDispatchers.clear();
 }
 
 /**
@@ -120,10 +186,20 @@ export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEF
   let session;
   try {
     session = await loadSession(proxyUrl);
-  } catch (error) {
-    throw new OpencodeTlsUnavailableError(
-      `wreq-js unavailable (${error instanceof Error ? error.message : "unknown"}) — install the optional wreq-js dependency to reach the OpenCode free tier`
-    );
+  } catch (wreqError) {
+    const wreqReason = wreqError instanceof Error ? wreqError.message : "unknown";
+    if (!nativeFallbackLogged) {
+      nativeFallbackLogged = true;
+      console.warn(`[OpenCode] wreq-js unavailable (${wreqReason}); using Node TLS with the OpenCode cipher list`);
+    }
+    try {
+      return await nativeTlsFetch(url, init, { signal, timeoutMs, proxyUrl });
+    } catch (error) {
+      if (error?.name === "AbortError" || signal?.aborted) throw error;
+      throw new OpencodeTlsUnavailableError(
+        `wreq-js unavailable (${wreqReason}) and the Node TLS fallback failed (${error instanceof Error ? error.message : "unknown"})`
+      );
+    }
   }
 
   const options = {
@@ -147,4 +223,4 @@ export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEF
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
 }
 
-export const __test__ = { OPENCODE_CIPHER_LIST, normalizeProxyKey, sessionsByProxy };
+export const __test__ = { OPENCODE_CIPHER_LIST, normalizeProxyKey, sessionsByProxy, nativeDispatchers };

@@ -3,14 +3,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // The free gate keys on the TLS ClientHello: on one process and egress IP the
 // same body/headers answered 429 over Node's OpenSSL fingerprint and 200 over
 // the cipher list below. These tests pin the wiring, not the upstream.
-const { createSessionMock, loadRuntimeDepMock } = vi.hoisted(() => ({
+const { createSessionMock, loadRuntimeDepMock, undiciMock } = vi.hoisted(() => ({
   createSessionMock: vi.fn(),
   loadRuntimeDepMock: vi.fn(),
+  undiciMock: {
+    fetch: vi.fn(),
+    Agent: vi.fn(function Agent(opts) { this.opts = opts; this.close = async () => {}; }),
+    ProxyAgent: vi.fn(function ProxyAgent(opts) { this.opts = opts; this.close = async () => {}; }),
+  },
 }));
 
 vi.mock("../../open-sse/services/lazyRuntime.js", () => ({
   loadRuntimeDep: loadRuntimeDepMock,
 }));
+
+vi.mock("undici", () => undiciMock);
 
 describe("opencodeTlsClient", () => {
   beforeEach(async () => {
@@ -18,6 +25,9 @@ describe("opencodeTlsClient", () => {
     createSessionMock.mockReset();
     loadRuntimeDepMock.mockReset();
     loadRuntimeDepMock.mockResolvedValue({ createSession: createSessionMock });
+    undiciMock.fetch.mockReset();
+    undiciMock.Agent.mockClear();
+    undiciMock.ProxyAgent.mockClear();
   });
 
   it("uses the cipher list the upstream accepts and sends ALPN-negotiated requests", async () => {
@@ -63,16 +73,48 @@ describe("opencodeTlsClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("surfaces an actionable error when wreq-js is unavailable", async () => {
-    loadRuntimeDepMock.mockRejectedValue(new Error("MODULE_NOT_FOUND"));
+  it("falls back to undici with the same cipher list when wreq-js is unavailable", async () => {
+    // e.g. FreeBSD: wreq-js ships no binary for the platform.
+    loadRuntimeDepMock.mockRejectedValue(new Error("Unsupported platform: freebsd-x64"));
+    undiciMock.fetch.mockResolvedValue(new Response("data: ok\n\n", { status: 200 }));
+
+    const { opencodeTlsFetch, __test__ } = await import("../../open-sse/services/opencodeTlsClient.js");
+    const result = await opencodeTlsFetch("https://opencode.ai/a", { method: "POST", body: "{}" });
+
+    expect(result.status).toBe(200);
+    expect(undiciMock.Agent).toHaveBeenCalledTimes(1);
+    expect(undiciMock.Agent.mock.calls[0][0].connect.ciphers).toBe(__test__.OPENCODE_CIPHER_LIST);
+    expect(undiciMock.fetch.mock.calls[0][1]).toEqual(expect.objectContaining({ method: "POST", body: "{}" }));
+  });
+
+  it("routes the fallback through an http proxy with the cipher list on the tunnelled TLS", async () => {
+    loadRuntimeDepMock.mockRejectedValue(new Error("Unsupported platform: freebsd-x64"));
+    undiciMock.fetch.mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const { opencodeTlsFetch, __test__ } = await import("../../open-sse/services/opencodeTlsClient.js");
+    const result = await opencodeTlsFetch("https://opencode.ai/a", {}, { proxyUrl: "http://user:pw@proxy.local:8080" });
+
+    expect(undiciMock.ProxyAgent).toHaveBeenCalledTimes(1);
+    const options = undiciMock.ProxyAgent.mock.calls[0][0];
+    expect(options.uri).toBe("http://user:pw@proxy.local:8080");
+    expect(options.requestTls.ciphers).toBe(__test__.OPENCODE_CIPHER_LIST);
+    expect(undiciMock.Agent).not.toHaveBeenCalled();
+    // Credentials never leak into the proof header.
+    expect(result.headers.get("x-9r-proxy-via")).toBe("http://proxy.local:8080");
+  });
+
+  it("refuses a socks proxy in the fallback instead of leaving over the direct IP", async () => {
+    loadRuntimeDepMock.mockRejectedValue(new Error("Unsupported platform: freebsd-x64"));
 
     const { opencodeTlsFetch, OpencodeTlsUnavailableError } = await import(
       "../../open-sse/services/opencodeTlsClient.js"
     );
 
-    await expect(opencodeTlsFetch("https://opencode.ai/a", {})).rejects.toBeInstanceOf(
-      OpencodeTlsUnavailableError
-    );
+    await expect(
+      opencodeTlsFetch("https://opencode.ai/a", {}, { proxyUrl: "socks5://proxy.local:1080" })
+    ).rejects.toBeInstanceOf(OpencodeTlsUnavailableError);
+    expect(undiciMock.fetch).not.toHaveBeenCalled();
+    expect(undiciMock.Agent).not.toHaveBeenCalled();
   });
 
   it("forwards the abort signal so a cancelled stream stops upstream", async () => {
