@@ -1,3 +1,4 @@
+import { buildKiroIdeUserAgentHeaders } from "open-sse/config/kiroIdentity.js";
 import { KIRO_CONFIG, assertValidAwsRegion } from "../constants/oauth.js";
 
 /**
@@ -306,8 +307,7 @@ export class KiroService {
         "Authorization": `Bearer ${apiKey}`,
         "TokenType": "API_KEY",
         "Accept": "application/json",
-        "User-Agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
-        "X-Amz-User-Agent": "aws-sdk-js/3.0.0 kiro-ide/1.0.0",
+        ...buildKiroIdeUserAgentHeaders({ apiKey }),
       },
     });
 
