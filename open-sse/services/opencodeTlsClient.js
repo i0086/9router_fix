@@ -13,8 +13,12 @@
 // undici with the same cipher list: Node's OpenSSL honours `ciphers` for the
 // ClientHello, and that list alone passes the gate (verified 2026-11-21:
 // undici+cipherList 200, undici default 429 FreeUsageLimitError).
+// That only holds on OpenSSL >= 3.5. Older OpenSSL (FreeBSD base 3.0) sends a
+// ClientHello the gate refuses whatever the cipher list, so there the fallback
+// goes through the Go forwarder in ./opencodeTlsHelper.js instead.
 
 import { loadRuntimeDep } from "./lazyRuntime.js";
+import { opensslNeedsHelper, resolveHelperPath, getHelper, stopHelper, helperFetch } from "./opencodeTlsHelper.js";
 
 // BoringSSL/Chrome-family cipher list the upstream accepts, in the order Bun
 // sends it. Only the list's hash is compared, so this must stay verbatim.
@@ -110,6 +114,7 @@ async function loadSession(proxyUrl = "") {
 const nativeDispatchers = new Map();
 let undiciModule = null;
 let nativeFallbackLogged = false;
+let helperMissingLogged = false;
 
 async function loadNativeDispatcher(proxyUrl, timeoutMs) {
   const key = `${normalizeProxyKey(proxyUrl)}::${timeoutMs}`;
@@ -146,7 +151,31 @@ async function loadNativeDispatcher(proxyUrl, timeoutMs) {
   return dispatcher;
 }
 
+let loopbackDispatcher = null;
+
+async function viaHelper(bin, url, init, { signal, timeoutMs, proxyUrl }) {
+  undiciModule ??= await import("undici");
+  loopbackDispatcher ??= new undiciModule.Agent({ headersTimeout: timeoutMs, bodyTimeout: 0 });
+  const helper = await getHelper(bin);
+  const res = await helperFetch(undiciModule.fetch, helper, url, init, { signal, proxyUrl, dispatcher: loopbackDispatcher });
+  if (!proxyUrl) return res;
+  const headers = new Headers(res.headers);
+  headers.set("x-9r-proxy-via", normalizeProxyKey(proxyUrl) || "helper-proxy");
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 async function nativeTlsFetch(url, init, { signal, timeoutMs, proxyUrl }) {
+  if (opensslNeedsHelper()) {
+    const bin = resolveHelperPath();
+    if (bin) return viaHelper(bin, url, init, { signal, timeoutMs, proxyUrl });
+    if (!helperMissingLogged) {
+      helperMissingLogged = true;
+      console.warn(
+        `[OpenCode] Node links OpenSSL ${process.versions.openssl} (< 3.5), whose ClientHello the free tier refuses. ` +
+        "Build open-sse/services/opencodeTlsHelper (go build) and set OPENCODE_TLS_HELPER, or place it at <DATA_DIR>/runtime/bin/opencode-tls-helper"
+      );
+    }
+  }
   const dispatcher = await loadNativeDispatcher(proxyUrl, timeoutMs);
   const res = await undiciModule.fetch(url, {
     method: init.method || "GET",
@@ -169,6 +198,9 @@ export function resetOpencodeTlsSession() {
   for (const promise of pending) promise?.then?.((session) => session.close?.()).catch(() => {});
   for (const dispatcher of nativeDispatchers.values()) dispatcher?.close?.().catch?.(() => {});
   nativeDispatchers.clear();
+  loopbackDispatcher?.close?.().catch?.(() => {});
+  loopbackDispatcher = null;
+  stopHelper();
 }
 
 /**
@@ -190,7 +222,7 @@ export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEF
     const wreqReason = wreqError instanceof Error ? wreqError.message : "unknown";
     if (!nativeFallbackLogged) {
       nativeFallbackLogged = true;
-      console.warn(`[OpenCode] wreq-js unavailable (${wreqReason}); using Node TLS with the OpenCode cipher list`);
+      console.warn(`[OpenCode] wreq-js unavailable (${wreqReason}); using the native TLS fallback with the OpenCode cipher list`);
     }
     try {
       return await nativeTlsFetch(url, init, { signal, timeoutMs, proxyUrl });
