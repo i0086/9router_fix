@@ -2,10 +2,10 @@
  * Kiro (AWS CodeWhisperer) usage handler
  */
 
-import { buildKiroIdeUserAgentHeaders } from "../../config/kiroIdentity.js";
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
 import { resolveDefaultProfileArn } from "../../config/kiroConstants.js";
 import { U, parseResetTime } from "./shared.js";
+import { buildKiroIdentityHeaders } from "../../shared/kiroIdentity.js";
 
 /**
  * Kiro (AWS CodeWhisperer) Usage
@@ -59,6 +59,9 @@ export async function getKiroUsage(accessToken, providerSpecificData, proxyOptio
   const isExternalIdp = authMethod === "external_idp";
   const apiKeyHeaders = isApiKey ? { tokentype: "API_KEY" } : {};
   const externalIdpHeaders = isExternalIdp ? { TokenType: "EXTERNAL_IDP" } : {};
+  // Same identity as inference on every attempt, so the quota call passes Kiro's
+  // client-version gate too (#5613).
+  const identityHeaders = buildKiroIdentityHeaders({ accessToken, providerSpecificData });
 
   // For api-key auth, never inject the shared default placeholder profileArn —
   // CodeWhisperer 403s a request whose profileArn isn't owned by the key's
@@ -84,7 +87,7 @@ export async function getKiroUsage(accessToken, providerSpecificData, proxyOptio
           headers: {
             "Authorization": `Bearer ${accessToken}`,
             "Accept": "application/json",
-            ...buildKiroIdeUserAgentHeaders({ accessToken }),
+            ...identityHeaders,
             ...apiKeyHeaders,
             ...externalIdpHeaders,
           },
@@ -101,6 +104,7 @@ export async function getKiroUsage(accessToken, providerSpecificData, proxyOptio
           "Content-Type": "application/x-amz-json-1.0",
           "x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
           "Accept": "application/json",
+          ...identityHeaders,
           ...apiKeyHeaders,
           ...externalIdpHeaders,
         },
@@ -124,6 +128,7 @@ export async function getKiroUsage(accessToken, providerSpecificData, proxyOptio
           headers: {
             "Authorization": `Bearer ${accessToken}`,
             "Accept": "application/json",
+            ...identityHeaders,
             ...apiKeyHeaders,
             ...externalIdpHeaders,
           },
